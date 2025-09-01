@@ -146,6 +146,7 @@ tokio = { workspace = true, default-features = false, features = [
     "time",
     "sync",
 ] }
+socket2 = { version = "0.5.8", features = ["all"] }
 tokio-tungstenite = { workspace = true, optional = true, features = ["url"] }
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 

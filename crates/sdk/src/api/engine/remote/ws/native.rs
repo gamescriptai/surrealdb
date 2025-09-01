@@ -25,9 +25,11 @@ use futures::SinkExt;
 use futures::StreamExt;
 use revision::revisioned;
 use serde::Deserialize;
+use socket2::{Socket, TcpKeepalive};
 use std::collections::hash_map::Entry;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicI64;
+use std::time::Duration;
 use surrealdb_core::sql::Value as CoreValue;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -39,6 +41,7 @@ use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{client_async_tls_with_config, client_async_with_config};
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
@@ -49,6 +52,10 @@ pub(crate) const MAX_FRAME_SIZE: usize = 16 << 20; // 16 MiB
 pub(crate) const WRITE_BUFFER_SIZE: usize = 128000; // tungstenite default
 pub(crate) const MAX_WRITE_BUFFER_SIZE: usize = WRITE_BUFFER_SIZE + MAX_MESSAGE_SIZE; // Recommended max according to tungstenite docs
 pub(crate) const NAGLE_ALG: bool = false;
+
+pub(crate) const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(60);
+pub(crate) const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 type MessageSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type MessageStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
@@ -66,10 +73,35 @@ impl From<Tls> for Connector {
 	}
 }
 
+async fn configure_tcp_keepalive(tcp_stream: TcpStream) -> Result<TcpStream> {
+	let std_stream = tcp_stream
+		.into_std()
+		.map_err(|e| Error::Ws(format!("Failed to convert tokio stream to std: {}", e)))?;
+
+	let socket = Socket::from(std_stream);
+
+	let keepalive = TcpKeepalive::new()
+		.with_time(TCP_KEEPALIVE_TIME)
+		.with_interval(TCP_KEEPALIVE_INTERVAL)
+		.with_retries(TCP_KEEPALIVE_RETRIES);
+
+	socket
+		.set_tcp_keepalive(&keepalive)
+		.map_err(|e| Error::Ws(format!("Failed to set TCP keep-alive: {}", e)))?;
+
+	socket
+		.set_nodelay(!NAGLE_ALG)
+		.map_err(|e| Error::Ws(format!("Failed to set nodelay: {}", e)))?;
+
+	let std_stream = socket.into();
+	Ok(TcpStream::from_std(std_stream)
+		.map_err(|e| Error::Ws(format!("Failed to convert std stream back to tokio: {}", e)))?)
+}
+
 pub(crate) async fn connect(
 	endpoint: &Endpoint,
 	config: Option<WebSocketConfig>,
-	#[allow(unused_variables)] maybe_connector: Option<Connector>,
+	maybe_connector: Option<Connector>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
 	let mut request = (&endpoint.url).into_client_request()?;
 
@@ -77,17 +109,30 @@ pub(crate) async fn connect(
 		.headers_mut()
 		.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(super::REVISION_HEADER));
 
+	let host = endpoint
+		.url
+		.host_str()
+		.ok_or_else(|| Error::Ws("Invalid host in URL".to_string()))?;
+	let port = endpoint.url.port().unwrap_or(if endpoint.url.scheme() == "wss" || endpoint.url.scheme() == "https" {
+		443
+	} else {
+		80
+	});
+
+	let tcp_stream = TcpStream::connect((host, port))
+		.await
+		.map_err(|e| Error::Ws(format!("Failed to connect TCP stream: {}", e)))?;
+
+	let tcp_stream = configure_tcp_keepalive(tcp_stream).await?;
+
 	#[cfg(any(feature = "native-tls", feature = "rustls"))]
-	let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
-		request,
-		config,
-		NAGLE_ALG,
-		maybe_connector,
-	)
-	.await?;
+	let (socket, _) = client_async_tls_with_config(request, tcp_stream, config, maybe_connector).await?;
 
 	#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-	let (socket, _) = tokio_tungstenite::connect_async_with_config(request, config, NAGLE_ALG).await?;
+	let (socket, _) = {
+		let stream = MaybeTlsStream::Plain(tcp_stream);
+		client_async_with_config(request, stream, config).await?
+	};
 
 	Ok(socket)
 }
